@@ -1,0 +1,476 @@
+
+<style>
+* { box-sizing: border-box; }
+.nav { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:20px; }
+.nav-btn { font-size:12px; padding:5px 12px; border-radius:20px; border:0.5px solid var(--color-border-secondary); background:var(--color-background-secondary); color:var(--color-text-secondary); cursor:pointer; transition:all .15s; }
+.nav-btn.active, .nav-btn:hover { background:var(--color-background-info); color:var(--color-text-info); border-color:var(--color-border-info); }
+.panel { display:none; }
+.panel.active { display:block; }
+.panel-title { font-size:16px; font-weight:500; color:var(--color-text-primary); margin:0 0 4px; }
+.panel-sub { font-size:12px; color:var(--color-text-secondary); margin:0 0 16px; }
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+.card { background:var(--color-background-secondary); border-radius:var(--border-radius-md); padding:12px 14px; }
+.card-title { font-size:12px; font-weight:500; color:var(--color-text-primary); margin:0 0 6px; display:flex; align-items:center; gap:6px; }
+.card-body { font-size:12px; color:var(--color-text-secondary); line-height:1.6; margin:0; }
+.card.highlight { background:var(--color-background-warning); }
+.card.highlight .card-title { color:var(--color-text-warning); }
+.card.highlight .card-body { color:var(--color-text-warning); }
+.card.danger { background:var(--color-background-danger); }
+.card.danger .card-title { color:var(--color-text-danger); }
+.card.danger .card-body { color:var(--color-text-danger); }
+.card.success { background:var(--color-background-success); }
+.card.success .card-title { color:var(--color-text-success); }
+.card.success .card-body { color:var(--color-text-success); }
+.flow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin:8px 0; }
+.flow-step { font-size:11px; padding:4px 10px; border-radius:4px; background:var(--color-background-primary); border:0.5px solid var(--color-border-secondary); color:var(--color-text-primary); white-space:nowrap; }
+.flow-arrow { color:var(--color-text-tertiary); font-size:12px; }
+.tag { display:inline-block; font-size:10px; padding:2px 7px; border-radius:10px; font-weight:500; margin-right:4px; }
+.tag.blue { background:var(--color-background-info); color:var(--color-text-info); }
+.tag.red { background:var(--color-background-danger); color:var(--color-text-danger); }
+.tag.green { background:var(--color-background-success); color:var(--color-text-success); }
+.tag.amber { background:var(--color-background-warning); color:var(--color-text-warning); }
+.divider { height:0.5px; background:var(--color-border-tertiary); margin:12px 0; }
+.mono { font-family:var(--font-mono); font-size:11px; background:var(--color-background-tertiary); border-radius:4px; padding:8px 10px; color:var(--color-text-primary); line-height:1.7; margin:6px 0; }
+.drill-btn { font-size:12px; margin-top:10px; }
+@media(max-width:520px){ .two-col { grid-template-columns:1fr; } }
+</style>
+<h2 class="sr-only">Interactive deep dive reference for file sync system design — Dropbox / Google Drive</h2>
+
+<div class="nav" id="nav"></div>
+<div id="panels"></div>
+
+<script>
+const sections = [
+  {
+    id:'chunking', label:'CDC Chunking',
+    title:'Content-defined chunking (CDC)',
+    sub:'How file content is split into deduplicable units',
+    content: () => `
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-cut" aria-hidden="true"></i> Fixed-size failure mode</div>
+          <p class="card-body">Boundaries are at byte offsets 0, N, 2N… Insert 1 byte early in a 1 GB file → every downstream boundary shifts → every downstream chunk hash changes → ~100% re-upload. Dedup is destroyed.</p>
+        </div>
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-fingerprint" aria-hidden="true"></i> CDC mechanism</div>
+          <p class="card-body">Rabin rolling hash slides a 48-byte window across the file byte-by-byte. Declare a boundary when <code>hash % D == r</code>. Boundaries are content-derived, not position-derived. Insert a byte → resynchronises within ~1 chunk.</p>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">Rolling hash math (O(1) per byte)</div>
+        <div class="mono">H = (b[i]·p^(w-1) + … + b[i+w-1]·p^0) mod M
+slide: H_new = (H_old − b[out]·p^(w-1))·p + b[in]  mod M</div>
+        <p class="card-body" style="margin-top:6px">The outgoing byte is subtracted (scaled by p^w-1) and the new byte added. No full recompute — just an update. Boundary condition D controls expected chunk size.</p>
+      </div>
+      <div class="two-col">
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Min/max bounds — critical</div>
+          <p class="card-body">Without bounds, statistical variance produces 2-byte or 100 MB chunks. Production: min 1 MB, target 4 MB, max 8 MB. Below min → skip boundary. Above max → force boundary.</p>
+        </div>
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-lock" aria-hidden="true"></i> Encrypted/compressed files</div>
+          <p class="card-body">Random bytes → no content patterns → no resynchronisation advantage. CDC still produces correct chunks, just near-average size everywhere. <strong>Always chunk before encrypting.</strong> Dropbox does this.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "What's the two-hash trick in FastCDC?" — Loose mask below target size (more boundaries), tight mask above (fewer). Tighter size distribution, same content-addressing. Dropbox's approach approximates this.<br><br><span class="tag red">Trap</span> Rabin hash ≠ chunk identity hash. Rabin is only for finding boundaries. SHA-256 of chunk content is the dedup key in the block store.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Go deeper on the FastCDC two-hash trick and how Dropbox tunes chunk size distribution')">Go deeper on FastCDC ↗</button>
+    `
+  },
+  {
+    id:'upload', label:'Resumable Upload',
+    title:'Resumable chunked upload',
+    sub:'Session state, idempotency, and the manifest round-trip',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">Upload flow — the manifest handshake</div>
+        <div class="flow">
+          <span class="flow-step">Client computes chunk hashes</span><span class="flow-arrow">→</span>
+          <span class="flow-step">POST manifest (all hashes)</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Server replies: "need chunks X, Y"</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Upload only missing chunks</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Commit version</span>
+        </div>
+        <p class="card-body" style="margin-top:6px">The manifest round-trip gives you dedup and resumability simultaneously. If the file is already 100% present on the server, the commit happens with zero bytes uploaded — "zero-byte upload" for duplicate files.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-server" aria-hidden="true"></i> Session state — where it lives</div>
+          <p class="card-body">Upload session (session_id → chunks_received set) must live in a distributed store (Redis/DynamoDB), not in-memory on one server. If that server dies mid-upload, any server can resume. Session TTL ~24–48h.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-refresh" aria-hidden="true"></i> Idempotency</div>
+          <p class="card-body">Each chunk PUT is idempotent keyed on (session_id, chunk_hash). Uploading the same chunk twice is safe — second write is a no-op. The commit step is a compare-and-swap on the version, not a blind write.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-link" aria-hidden="true"></i> Presigned URLs</div>
+          <p class="card-body">Server generates presigned S3/GCS URLs per chunk. Client uploads chunks directly to blob storage, bypassing your API servers entirely. Eliminates double-transfer and scales upload bandwidth independently.</p>
+        </div>
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Partial commit danger</div>
+          <p class="card-body">Never commit a version until all chunks are durably stored. Commit is a metadata-only write that atomically moves the file pointer. If any chunk PUT failed, the commit must be rejected — client retries from manifest step.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "What happens if two clients upload the same large file concurrently?" — Both manifest handshakes complete, one wins the commit CAS, the other gets a conflict. Only one set of chunks is stored either way (dedup wins).<br><br><span class="tag red">Trap</span> Don't say "upload to your API server then forward to S3." Presigned direct-to-S3 is the production pattern. Routing through your servers limits throughput and doubles cost.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how does the presigned URL flow work for chunked uploads — what exactly does each API call look like?')">Presigned URL flow ↗</button>
+    `
+  },
+  {
+    id:'delta', label:'Delta Sync',
+    title:'Delta sync — what travels over the wire',
+    sub:'How clients exchange only changed data, not full files',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">What "delta" actually means in this system</div>
+        <div class="flow">
+          <span class="flow-step">File changes on client A</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Client recomputes chunk hashes</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Diff vs local index</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Upload only new chunks</span><span class="flow-arrow">→</span>
+          <span class="flow-step">Push new manifest to client B</span><span class="flow-arrow">→</span>
+          <span class="flow-step">B downloads only missing chunks</span>
+        </div>
+        <p class="card-body" style="margin-top:6px">The "delta" is two separate things: (1) the chunk manifest diff — which chunk hashes changed — which is tiny metadata; (2) the actual chunk bytes — only the ones whose hash is new. The metadata plane and content plane are decoupled.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-database" aria-hidden="true"></i> Local chunk index</div>
+          <p class="card-body">Each client maintains a local SQLite index: file path → ordered list of (chunk_hash, chunk_size). On a file-system event, client re-chunks only the modified region (CDC boundaries help bound this), diffs the hash list, and knows exactly which chunks to upload.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-arrows-exchange" aria-hidden="true"></i> Sync on the receive side</div>
+          <p class="card-body">Client B receives the new manifest. It checks its local chunk cache — any chunk it already has (from a previous version or another file) doesn't need downloading. This is the cross-file dedup win on the download side.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-file-diff" aria-hidden="true"></i> Edit-in-middle win</div>
+          <p class="card-body">User edits the middle of a 500 MB file. CDC: 1–2 chunk boundaries shift, ~8–16 MB re-uploaded. Fixed: every chunk after the edit point is "new", ~250 MB re-uploaded. This is the 30–50× difference in practice.</p>
+        </div>
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Append-only files</div>
+          <p class="card-body">Log files that only grow at the end: CDC and fixed-size behave identically since old boundaries don't shift. But CDC still helps if the file is ever compacted or rewritten. Never assume append-only in your design.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "How do you handle very small files — files smaller than one chunk?" — Store them directly in the metadata record (inline storage), no chunk store needed. Dropbox inlines files under ~256 bytes.<br><br><span class="tag red">Trap</span> Don't conflate chunk-level delta sync with rsync/binary-diff algorithms. rsync finds matching blocks byte-by-byte; CDC-based systems match whole chunks by hash. CDC is coarser but dramatically faster on the client side (no per-byte comparison).</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('How does Dropbox handle selective sync and partial sync — when a client only wants a subset of folders?')">Selective sync design ↗</button>
+    `
+  },
+  {
+    id:'conflict', label:'Conflict Resolution',
+    title:'Conflict resolution — the hard offline-edit case',
+    sub:'Vector clocks, fork detection, and the conflict copy strategy',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">When does a conflict occur?</div>
+        <p class="card-body">Client A edits file.txt offline. Client B also edits file.txt offline. Both come online and try to sync. The server sees two versions both claiming the same parent — this is a fork. The system must detect the fork, not silently overwrite one.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-clock" aria-hidden="true"></i> Version parent chain</div>
+          <p class="card-body">Every version record has a <code>parent_version_id</code>. A valid sync: client's local parent matches server's current version → fast-forward. A conflict: client's parent is an ancestor but not current → fork detected.</p>
+          <div class="mono">version N   ← parent of both
+  ├── version N+1a  (client A)
+  └── version N+1b  (client B)  ← conflict</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-git-branch" aria-hidden="true"></i> Dropbox strategy: fork it</div>
+          <p class="card-body">Don't merge. Create "file (Alice's conflicted copy 2024-01-15).txt" as a new file. Both versions are preserved. User resolves manually. Simple, safe, no risk of data loss. Google Docs solves this differently with OT — but only because it has real-time collaboration infrastructure.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-vectors" aria-hidden="true"></i> Vector clocks (richer detection)</div>
+          <p class="card-body">Each client maintains a vector clock {clientA: 3, clientB: 2}. On sync, compare clocks. If neither dominates the other (concurrent updates), it's a conflict. If one dominates (causally after), it's a fast-forward. Enables finer detection than parent pointer alone.</p>
+        </div>
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Last-write-wins is wrong</div>
+          <p class="card-body">Comparing wall-clock timestamps is broken — clocks skew across devices by seconds or minutes. A "later" timestamp on a stale edit can silently overwrite newer work. Never use wall time for conflict detection. Always use logical clocks.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card danger">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag red">Hard follow-up</span> "What about three-way merge for text files?" — Git-style 3-way merge is possible: find common ancestor version, diff A→ancestor and B→ancestor, merge diffs. But you only do this for text files where a merge is semantically meaningful. Binary files (images, PDFs) always fork — there's no meaningful merge.<br><br><span class="tag amber">CRDT angle</span> Google Docs uses CRDTs or OT at the character level. This requires the server to be always-on during the edit session. Dropbox's model is "sync when reconnected" — fundamentally different tradeoff.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how does three-way merge work for text conflicts in a file sync system, and when do you fall back to forking?')">Three-way merge design ↗</button>
+    `
+  },
+  {
+    id:'dedup', label:'Deduplication',
+    title:'Deduplication — and the convergent encryption trap',
+    sub:'Reference counting, cross-user dedup, and the security gotcha',
+    content: () => `
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-stack" aria-hidden="true"></i> How the block store works</div>
+          <p class="card-body">Block store maps <code>SHA256(chunk) → {blob_location, ref_count}</code>. On upload: check if hash exists. If yes, increment ref_count, skip upload. On delete: decrement ref_count. When ref_count hits 0, schedule blob deletion (with GC delay).</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-users" aria-hidden="true"></i> Within-user vs cross-user dedup</div>
+          <p class="card-body">Within-user dedup: safe, no privacy issues. Same user's duplicate files share one blob. Cross-user dedup: powerful storage savings but introduces a privacy/security attack surface.</p>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">Convergent encryption — the mechanism</div>
+        <div class="mono">key = HMAC(server_secret, SHA256(plaintext))
+ciphertext = AES-256(key, plaintext)</div>
+        <p class="card-body" style="margin-top:6px">Identical plaintexts produce identical ciphertexts (because the key is derived from content). This enables dedup on encrypted data — the server can compare ciphertext hashes without ever seeing plaintext. But this creates a vulnerability.</p>
+      </div>
+      <div class="two-col">
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-shield-x" aria-hidden="true"></i> Proof-of-knowledge attack</div>
+          <p class="card-body">If I suspect you have file X, I upload file X myself. If the server says "I already have this chunk" (dedup hit) → I've confirmed you have it, without ever seeing your data. This is a real attack against naive cross-user dedup. Dropbox was caught doing this in 2011.</p>
+        </div>
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-shield-check" aria-hidden="true"></i> Mitigations</div>
+          <p class="card-body">(1) Per-user dedup only — sacrifice storage efficiency for privacy. (2) Require proof-of-possession: client must send a decryption challenge before dedup credit is granted. (3) Use client-side encryption with user-controlled keys — server can't dedup at all but storage is fully private.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-trash" aria-hidden="true"></i> GC and ref-count races</div>
+          <p class="card-body">Race: ref_count reaches 0, blob scheduled for deletion. Simultaneously, new user uploads same chunk — dedup check says "exists", but GC deletes it. Fix: tombstone period (don't delete for 24h), or use a distributed lock on the hash during GC.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-chart-bar" aria-hidden="true"></i> Real-world dedup ratios</div>
+          <p class="card-body">Within a user's account: 2–5× storage reduction typical. Across users (large deployments): 10–20× for common files (OS images, common docs). Most storage savings come from a small number of extremely common files.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag red">Trap</span> Most candidates describe dedup without mentioning the security attack. Bringing it up proactively signals you've thought about this in production.<br><br><span class="tag amber">Follow-up</span> "How do you handle ref_count decrement on file delete when the file has 1000 chunks?" — Async job. Never decrement synchronously in the delete request path. Queue chunk hashes for deferred GC.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how does the garbage collection process work for orphaned chunks in a distributed block store?')">GC design for orphaned chunks ↗</button>
+    `
+  },
+  {
+    id:'metadata', label:'Metadata & Versioning',
+    title:'Metadata schema — append-only vs mutable',
+    sub:'File namespace, version history, and the changelog pattern',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">The core schema question: update in place, or append?</div>
+        <p class="card-body">Mutable approach: one row per file, UPDATE on each change. Simple, but loses history and makes point-in-time recovery hard. Append-only: each file change is an INSERT of a new version row. The current version is a pointer. History, audit log, and versioning fall out for free.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-table" aria-hidden="true"></i> Core tables</div>
+          <div class="mono">files(file_id, namespace_id, name, current_version_id)
+
+file_versions(version_id, file_id, parent_version_id,
+  chunk_manifest_hash, size_bytes,
+  created_at, created_by, is_deleted)</div>
+          <p class="card-body" style="margin-top:4px">Restore to version N: update current_version_id pointer. No data movement. Soft delete: is_deleted=true on a new version row.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-folder-open" aria-hidden="true"></i> Namespace design</div>
+          <p class="card-body">File paths are stored as an adjacency list (parent_folder_id) or a materialized path (<code>/a/b/c</code> as a string with prefix queries). Materialized path is faster for "list all children" but makes moves O(n) subtree updates. Adjacency list makes moves O(1) but tree traversal requires recursive CTEs.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-share" aria-hidden="true"></i> Shared folders complexity</div>
+          <p class="card-body">A shared folder appears in multiple users' namespaces. Don't duplicate the folder tree. Store one canonical namespace + a <code>mounts</code> table: (user_id, folder_id, mount_path). The folder lives once; each user has a mount record pointing to it.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-history" aria-hidden="true"></i> Version retention policy</div>
+          <p class="card-body">Dropbox Free: 30 days. Pro: 180 days. Business: 1 year+. Implement as a scheduled cleanup job that deletes version rows older than the retention window, then decrements chunk ref_counts for any chunks no longer referenced. Never do this synchronously.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-list" aria-hidden="true"></i> Chunk manifest storage</div>
+          <p class="card-body">Don't store the full chunk list in the version row. Store a <code>chunk_manifest_hash</code> (hash of the ordered list of chunk hashes), and the actual list in a separate <code>chunk_manifests</code> table keyed by that hash. Identical file content → same manifest hash → deduplicated manifest storage too.</p>
+        </div>
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Hotspot on current_version_id</div>
+          <p class="card-body">Frequently-edited files create hot rows in the <code>files</code> table. The current_version_id pointer update is a write on every save. Shard by file_id, not user_id — otherwise one active user's files are all on one shard.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "How do you implement search?" — You can't query by file content across billions of files. You index file names and metadata (size, type, created_at) in Elasticsearch. Full-text content search requires a separate extraction + indexing pipeline (expensive, usually behind a premium tier).<br><br><span class="tag red">Trap</span> Don't store file paths as a single string like <code>/user/docs/report.pdf</code>. Path components as a tree structure (adjacency list) supports rename and move operations without rewriting every descendant path string.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how do you design the database schema for shared folders and permissions in Google Drive?')">Shared folder schema ↗</button>
+    `
+  },
+  {
+    id:'notifications', label:'Change Feed',
+    title:'Change feed and notification layer',
+    sub:'Cursor-based sync, at-least-once delivery, and thundering herd',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">The problem: how does client B know client A just changed a file?</div>
+        <p class="card-body">Options: polling (wasteful), long-polling (OK), SSE/WebSocket (good), push notification (mobile). The real design question is not the transport — it's the change feed underneath, which must be ordered, persistent, and efficiently queryable by cursor.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-list-details" aria-hidden="true"></i> Change log table</div>
+          <div class="mono">change_log(cursor_id BIGINT auto-increment,
+  namespace_id, file_id, version_id,
+  change_type, created_at)</div>
+          <p class="card-body" style="margin-top:4px">Clients store their last-seen cursor. On reconnect: "give me all changes since cursor 9821." Server queries change_log WHERE cursor_id > 9821 AND namespace_id = X. Cursor is a logical sequence number, not a timestamp.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-bell" aria-hidden="true"></i> Notification trigger</div>
+          <p class="card-body">When a change_log row is inserted, wake up all clients subscribed to that namespace. Don't send the change data in the notification — just "hey, you have changes." Client then polls with its cursor. This separates signalling from data delivery.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-storm" aria-hidden="true"></i> Thundering herd</div>
+          <p class="card-body">A shared folder with 10,000 members. One file changes → 10,000 SSE connections wake simultaneously → 10,000 cursor-poll requests hit the DB at the same moment. Fix: jitter the wake-up by 0–5s random delay. Or use a fan-out queue (Kafka topic per namespace) with rate-limited consumers.</p>
+        </div>
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-check" aria-hidden="true"></i> At-least-once guarantee</div>
+          <p class="card-body">The cursor model is inherently at-least-once: if a client is offline and misses notifications, it just re-polls from its last cursor on reconnect. It cannot miss changes. Clients must be idempotent — applying the same change twice must be safe (version check before applying).</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-device-mobile" aria-hidden="true"></i> Mobile: push vs polling</div>
+          <p class="card-body">Mobile clients can't hold persistent SSE connections (OS kills them). Use APNs/FCM push to wake the app, then the app polls from its cursor. The push payload is just a wake signal, never the actual change data (payload too small, delivery not guaranteed).</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-rotate" aria-hidden="true"></i> Change log retention</div>
+          <p class="card-body">Change log can't grow forever. Retain last 30 days (matching version history). A client offline for >30 days gets a "full resync required" response — it re-fetches the full current state of its namespace. Design for this from day one.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "How do you order changes across multiple files?" — The auto-incrementing cursor_id is a total order within a namespace. Across namespaces you don't need global ordering. But within a shared folder, cursor ordering guarantees clients converge to the same state.<br><br><span class="tag red">Trap</span> Don't use updated_at timestamps as the cursor. Clock skew means clients can miss events that arrived slightly out of order. Monotonic sequence numbers are the only safe cursor type.</span></p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how do you scale the notification layer for a shared folder with millions of subscribers?')">Large shared folder scaling ↗</button>
+    `
+  },
+  {
+    id:'acl', label:'Sharing & ACL',
+    title:'Sharing and access control',
+    sub:'Permission inheritance, Zanzibar, and the "can I read this?" query',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">The core ACL query that must be fast</div>
+        <p class="card-body">For every file operation (read, write, delete, share): can user U perform action A on resource R? This check happens on every API call. If it's slow, everything is slow. If it's wrong, you have a security breach.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-table" aria-hidden="true"></i> Naive ACL table</div>
+          <div class="mono">permissions(resource_id, resource_type,
+  user_id, role, granted_by, created_at)</div>
+          <p class="card-body" style="margin-top:4px">Works fine up to millions of rows. Breaks on permission inheritance: if folder /A grants reader to user U, does that propagate to /A/B/C? You'd need to walk the folder tree on every check.</p>
+        </div>
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-topology-star" aria-hidden="true"></i> Zanzibar model (Google)</div>
+          <p class="card-body">Store permissions as a relation graph: <code>(object, relation, user)</code> tuples. e.g. <code>(folder:A, owner, user:alice)</code>. Inheritance via <code>(folder:B, parent, folder:A)</code>. Check: is there a path in this graph from user to resource via allowed relations? Massively scalable, used by Google Drive.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-arrows-down" aria-hidden="true"></i> Permission inheritance</div>
+          <p class="card-body">Two strategies: (1) Lazy — walk the tree at check time (slow for deep trees). (2) Eager — denormalize permissions down the tree on every grant (fast reads, expensive writes, consistency lag). Production systems use eager denormalization with a permissions cache, invalidated on grant/revoke.</p>
+        </div>
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-lock-open" aria-hidden="true"></i> "Share link" design</div>
+          <p class="card-body">A share link is a capability token: long random ID that encodes (resource_id, permission_level). Stored as a row in a <code>share_links</code> table. Anyone with the token can access the resource. Revocable by deleting the row. Don't use JWT — you can't revoke them without a blocklist.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Recursive folder moves</div>
+          <p class="card-body">User moves /A (shared with org) into /B (private). Do permissions change? The system must decide: do inherited permissions follow the new parent, or are they locked at the old position? Most systems: new parent wins (re-inherit). Triggers a tree-walk to update all descendants.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-user-check" aria-hidden="true"></i> Role hierarchy</div>
+          <p class="card-body">Typical roles: viewer → commenter → editor → owner. Roles are ordered — an editor can do everything a viewer can. Implement as an enum with integer rank, not as a bitfield. Check: user_role >= required_role for the action.</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "How do you handle org-level sharing — share with everyone at acme.com?" — Domain-based ACL: instead of (resource, user_id), store (resource, domain). Evaluated at check time: does the requesting user's email domain match? Evaluate domain ACLs after user-specific ACLs — user-level denies should override.<br><br><span class="tag red">Hard follow-up</span> "How does Zanzibar handle stale permission caches during a revoke?" — Zookie pattern: every write returns a consistency token. Reads can pass the token to ensure they see state at-least-as-fresh as that write. This is the key Zanzibar contribution.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how does Google Zanzibar work — explain the tuple model, the check algorithm, and the zookie consistency token')">Zanzibar deep dive ↗</button>
+    `
+  },
+  {
+    id:'storage', label:'Blob Storage Tiers',
+    title:'Blob storage — hot, warm, and cold tiers',
+    sub:'Tiered storage, access patterns, and the cost/latency tradeoff',
+    content: () => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="card-title">Why tiering exists</div>
+        <p class="card-body">Hot storage (SSD-backed, S3 Standard) costs ~$0.023/GB/month. Cold storage (S3 Glacier) costs ~$0.004/GB/month — 6× cheaper. But retrieval from Glacier takes minutes to hours, not milliseconds. Most files are written once and rarely accessed again. Tiering exploits this access pattern asymmetry.</p>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-temperature" aria-hidden="true"></i> Access pattern reality</div>
+          <p class="card-body">Dropbox internal data: ~80% of storage bytes are in files not accessed in the last 90 days. ~5% of files account for ~80% of accesses (Zipf distribution). The right policy: tier aggressively, but get the access prediction right.</p>
+        </div>
+        <div class="card">
+          <div class="card-title"><i class="ti ti-arrows-move" aria-hidden="true"></i> Tiering policy</div>
+          <p class="card-body">Hot: accessed in last 30 days. Warm (Infrequent Access): 30–90 days. Cold (Glacier): 90+ days. Implemented as a background job that reads last_accessed from the chunk store and moves blobs via S3 lifecycle rules or explicit copy + delete.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card highlight">
+          <div class="card-title"><i class="ti ti-clock-pause" aria-hidden="true"></i> Cold retrieval latency</div>
+          <p class="card-body">User requests a file cold-tiered 2 years ago. Expedited Glacier retrieval: 1–5 minutes. Standard: 3–5 hours. Product decision: either show a "this file is being retrieved" UX, or keep all user-accessible files in warm at minimum. Only archive truly dead data (deleted files in trash).</p>
+        </div>
+        <div class="card success">
+          <div class="card-title"><i class="ti ti-coins" aria-hidden="true"></i> Chunk-level tiering</div>
+          <p class="card-body">Tier at the chunk level, not the file level. A large file might have 90% of its chunks cold (old versions never re-accessed) and 10% hot (recently edited suffix). Chunk-level tiering is more granular and saves more — file-level tiering leaves hot chunks in cold storage unnecessarily.</p>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-title"><i class="ti ti-world" aria-hidden="true"></i> Geographic replication</div>
+          <p class="card-body">Hot tier: 3× replicated across regions (durability + CDN-edge delivery). Warm: 2× regional. Cold: 1× with erasure coding (11 nines durability at lower cost than triple replication). Erasure coding splits a chunk into N+K shards — any N can reconstruct.</p>
+        </div>
+        <div class="card danger">
+          <div class="card-title"><i class="ti ti-alert-triangle" aria-hidden="true"></i> Tiering race condition</div>
+          <p class="card-body">Tiering job starts moving chunk C to cold. Simultaneously, user downloads a file containing C. Tiering job must check a "in-flight access" marker before deleting from hot. Or: keep the hot copy for a grace period after moving to cold (adds cost, avoids the race).</p>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div class="card highlight">
+        <div class="card-title"><i class="ti ti-help-circle" aria-hidden="true"></i> Interview depth check</div>
+        <p class="card-body"><span class="tag amber">Follow-up</span> "How does the chunk store know the last access time of each chunk?" — The blob store is not queried directly by users; they request files, which the metadata service translates to chunk IDs. The metadata layer records last_access per version. Use this to approximate per-chunk access recency.<br><br><span class="tag red">Trap</span> Don't propose tiering based on file creation date. Use last-access date. A 10-year-old file accessed yesterday is hot. A file uploaded yesterday and never opened again can be cold in 30 days.</p>
+      </div>
+      <button class="drill-btn" onclick="sendPrompt('Deep dive: how does erasure coding work for cold blob storage — compare vs triple replication for durability and cost')">Erasure coding vs replication ↗</button>
+    `
+  }
+];
+
+function render(activeId) {
+  const nav = document.getElementById('nav');
+  const panels = document.getElementById('panels');
+  nav.innerHTML = sections.map(s =>
+    `<button class="nav-btn ${s.id===activeId?'active':''}" onclick="render('${s.id}')">${s.label}</button>`
+  ).join('');
+  panels.innerHTML = sections.map(s => `
+    <div class="panel ${s.id===activeId?'active':''}">
+      <p class="panel-title">${s.title}</p>
+      <p class="panel-sub">${s.sub}</p>
+      ${s.content()}
+    </div>
+  `).join('');
+}
+render('chunking');
+</script>
