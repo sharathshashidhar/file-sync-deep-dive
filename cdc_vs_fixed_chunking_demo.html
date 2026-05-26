@@ -1,0 +1,199 @@
+
+<style>
+  .chunk-row { display:flex; gap:3px; flex-wrap:wrap; align-items:flex-end; min-height:52px; margin-bottom:6px; }
+  .byte { width:22px; height:34px; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:10px; font-family:var(--font-mono); flex-shrink:0; transition:background 0.3s, opacity 0.3s; }
+  .byte.unchanged { background:var(--color-background-secondary); color:var(--color-text-secondary); border:0.5px solid var(--color-border-tertiary); }
+  .byte.changed   { background:#FAECE7; color:#712B13; border:0.5px solid #D85A30; }
+  .byte.inserted  { background:#EF9F27; color:#412402; border:0.5px solid #BA7517; font-weight:500; }
+  .divider-fixed  { width:3px; background:#378ADD; border-radius:2px; height:44px; flex-shrink:0; }
+  .divider-cdc    { width:3px; background:#1D9E75; border-radius:2px; height:44px; flex-shrink:0; }
+  .chunk-label { font-size:11px; color:var(--color-text-tertiary); margin-bottom:2px; font-family:var(--font-mono); }
+  .stat-row { display:flex; gap:12px; margin:8px 0 16px; }
+  .stat { background:var(--color-background-secondary); border-radius:var(--border-radius-md); padding:8px 12px; flex:1; }
+  .stat-val { font-size:20px; font-weight:500; }
+  .stat-lbl { font-size:11px; color:var(--color-text-secondary); margin-top:2px; }
+  .stat.bad .stat-val  { color:var(--color-text-danger); }
+  .stat.good .stat-val { color:var(--color-text-success); }
+  .legend-dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .section-label { font-size:13px; font-weight:500; color:var(--color-text-primary); margin:16px 0 4px; }
+</style>
+<h2 class="sr-only">Interactive demo comparing fixed-size chunking vs content-defined chunking when bytes are inserted into a file</h2>
+
+<div style="display:flex;gap:12px;margin:0 0 16px;align-items:center;flex-wrap:wrap;">
+  <label style="font-size:13px;color:var(--color-text-secondary);">Insert bytes at position</label>
+  <input type="range" id="insert-pos" min="0" max="19" value="5" step="1" style="flex:1;min-width:120px;" oninput="render()">
+  <span id="pos-label" style="font-size:13px;font-weight:500;min-width:28px;text-align:right">5</span>
+  <label style="font-size:13px;color:var(--color-text-secondary);margin-left:8px;">Chunk size</label>
+  <input type="range" id="chunk-sz" min="4" max="8" value="5" step="1" style="width:80px;" oninput="render()">
+  <span id="sz-label" style="font-size:13px;font-weight:500;min-width:16px">5</span>
+</div>
+
+<div style="font-size:11px;color:var(--color-text-tertiary);margin-bottom:12px;">
+  <span style="margin-right:12px;"><span class="legend-dot" style="background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary)"></span>unchanged byte</span>
+  <span style="margin-right:12px;"><span class="legend-dot" style="background:#FAECE7;border:0.5px solid #D85A30"></span>chunk re-uploaded</span>
+  <span style="margin-right:12px;"><span class="legend-dot" style="background:#EF9F27;border:0.5px solid #BA7517"></span>inserted byte</span>
+  <span style="margin-right:6px;"><span class="legend-dot" style="background:#378ADD;width:4px;border-radius:1px"></span>fixed boundary</span>
+  <span><span class="legend-dot" style="background:#1D9E75;width:4px;border-radius:1px"></span>CDC boundary</span>
+</div>
+
+<div class="section-label">Fixed-size chunking</div>
+<div id="fixed-before-label" class="chunk-label">before: chunks</div>
+<div id="fixed-before" class="chunk-row"></div>
+<div id="fixed-after-label" class="chunk-label">after insert: chunks</div>
+<div id="fixed-after" class="chunk-row"></div>
+<div class="stat-row" id="fixed-stats"></div>
+
+<div class="section-label">Content-defined chunking (Rabin fingerprint)</div>
+<div id="cdc-before-label" class="chunk-label">before: chunks</div>
+<div id="cdc-before" class="chunk-row"></div>
+<div id="cdc-after-label" class="chunk-label">after insert: chunks</div>
+<div id="cdc-after" class="chunk-row"></div>
+<div class="stat-row" id="cdc-stats"></div>
+
+<div style="margin-top:8px;">
+  <button onclick="sendPrompt('Explain the Rabin fingerprint rolling hash algorithm — how does it compute chunk boundaries?')" style="font-size:12px;">How does the Rabin hash work? ↗</button>
+  <button onclick="sendPrompt('What are the min and max chunk size bounds in CDC, and why do they matter?')" style="font-size:12px;margin-left:8px;">Min/max bounds in CDC ↗</button>
+</div>
+
+<script>
+const N = 22;
+const BYTES = Array.from({length:N}, (_,i) => {
+  const vals = [0x3A,0x7F,0x12,0xC4,0x88,0x2B,0x55,0xE0,0x1D,0x9A,0x44,0xF3,0x06,0xB7,0x60,0x23,0xD8,0x4C,0x91,0x3E,0x77,0xAB];
+  return vals[i % vals.length];
+});
+
+function rollingHash(arr, windowSize) {
+  const MOD = 127, BASE = 31;
+  let h = 0;
+  for (let i = 0; i < Math.min(windowSize, arr.length); i++) h = (h * BASE + arr[i]) % MOD;
+  return h;
+}
+
+function cdcBoundaries(arr, windowSize, threshold) {
+  const boundaries = [];
+  const MOD = 127, BASE = 31;
+  let h = 0;
+  const window = [];
+  for (let i = 0; i < arr.length; i++) {
+    window.push(arr[i]);
+    h = (h * BASE + arr[i]) % MOD;
+    if (window.length > windowSize) {
+      const out = window.shift();
+      let remove = out;
+      for (let k = 0; k < windowSize - 1; k++) remove = (remove * BASE) % MOD;
+      h = ((h - remove + MOD * MOD) % MOD);
+    }
+    if (window.length === windowSize && h % threshold === 0 && i < arr.length - 1) {
+      boundaries.push(i);
+    }
+  }
+  return boundaries;
+}
+
+function getSeedBoundaries(len, chunkSz) {
+  const b = [];
+  for (let i = chunkSz - 1; i < len - 1; i += chunkSz) b.push(i);
+  return b;
+}
+
+function chunksFromBoundaries(len, boundaries) {
+  const chunks = [];
+  let prev = 0;
+  for (const b of boundaries) { chunks.push({start:prev, end:b+1}); prev = b+1; }
+  chunks.push({start:prev, end:len});
+  return chunks;
+}
+
+function renderChunkRow(container, bytes, chunks, changedSet, insertedIdx, dividerClass) {
+  container.innerHTML = '';
+  let bIdx = 0;
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    for (let i = chunk.start; i < chunk.end; i++) {
+      const div = document.createElement('div');
+      const val = bytes[i].toString(16).toUpperCase().padStart(2,'0');
+      div.className = 'byte ' + (i === insertedIdx ? 'inserted' : changedSet.has(i) ? 'changed' : 'unchanged');
+      div.textContent = val;
+      container.appendChild(div);
+    }
+    if (c < chunks.length - 1) {
+      const div = document.createElement('div');
+      div.className = dividerClass;
+      container.appendChild(div);
+    }
+    bIdx = chunk.end;
+  }
+}
+
+function statHtml(label, changed, total, good) {
+  const pct = Math.round(changed / total * 100);
+  return `<div class="stat ${good?'good':'bad'}">
+    <div class="stat-val">${pct}%</div>
+    <div class="stat-lbl">${label}<br>${changed} of ${total} chunks re-uploaded</div>
+  </div>`;
+}
+
+function render() {
+  const insertPos = parseInt(document.getElementById('insert-pos').value);
+  const chunkSz = parseInt(document.getElementById('chunk-sz').value);
+  document.getElementById('pos-label').textContent = insertPos;
+  document.getElementById('sz-label').textContent = chunkSz;
+
+  const beforeBytes = BYTES.slice(0, N);
+  const afterBytes = [...beforeBytes.slice(0, insertPos), 0xFF, ...beforeBytes.slice(insertPos)];
+  const insertedIdx = insertPos;
+
+  const fixedBefore = getSeedBoundaries(N, chunkSz);
+  const fixedAfter  = getSeedBoundaries(N+1, chunkSz);
+  const cdcThreshold = 5;
+  const cdcWin = 3;
+  const cdcBefore = cdcBoundaries(beforeBytes, cdcWin, cdcThreshold);
+  const cdcAfterB = cdcBoundaries(afterBytes, cdcWin, cdcThreshold);
+
+  const fChunksBefore = chunksFromBoundaries(N, fixedBefore);
+  const fChunksAfter  = chunksFromBoundaries(N+1, fixedAfter);
+  const cChunksBefore = chunksFromBoundaries(N, cdcBefore);
+  const cChunksAfter  = chunksFromBoundaries(N+1, cdcAfterB);
+
+  function hashChunk(bytes, chunk) {
+    let h = 0;
+    for (let i = chunk.start; i < chunk.end; i++) h = (h * 31 + bytes[i]) & 0xFFFFFF;
+    return h;
+  }
+  function countChanged(beforeChunks, afterChunks, bBytes, aBytes) {
+    const beforeHashes = new Set(beforeChunks.map(c => hashChunk(bBytes, c)));
+    return afterChunks.filter(c => !beforeHashes.has(hashChunk(aBytes, c))).length;
+  }
+
+  const fChanged = countChanged(fChunksBefore, fChunksAfter, beforeBytes, afterBytes);
+  const cChanged = countChanged(cChunksBefore, cChunksAfter, beforeBytes, afterBytes);
+
+  const fChangedIdxs = new Set();
+  const fBeforeHashes = new Map(fChunksBefore.map(c => [hashChunk(beforeBytes,c), c]));
+  fChunksAfter.forEach(c => {
+    if (!fBeforeHashes.has(hashChunk(afterBytes, c)))
+      for (let i = c.start; i < c.end; i++) fChangedIdxs.add(i);
+  });
+
+  const cChangedIdxs = new Set();
+  const cBeforeHashes = new Map(cChunksBefore.map(c => [hashChunk(beforeBytes,c), c]));
+  cChunksAfter.forEach(c => {
+    if (!cBeforeHashes.has(hashChunk(afterBytes, c)))
+      for (let i = c.start; i < c.end; i++) cChangedIdxs.add(i);
+  });
+
+  document.getElementById('fixed-before-label').textContent = `before: ${fChunksBefore.length} chunks of ~${chunkSz} bytes`;
+  document.getElementById('fixed-after-label').textContent  = `after insert: ${fChunksAfter.length} chunks — ${fChanged} changed`;
+  document.getElementById('cdc-before-label').textContent   = `before: ${cChunksBefore.length} CDC chunks`;
+  document.getElementById('cdc-after-label').textContent    = `after insert: ${cChunksAfter.length} chunks — ${cChanged} changed`;
+
+  renderChunkRow(document.getElementById('fixed-before'), beforeBytes, fChunksBefore, new Set(), -1, 'divider-fixed');
+  renderChunkRow(document.getElementById('fixed-after'),  afterBytes,  fChunksAfter,  fChangedIdxs, insertedIdx, 'divider-fixed');
+  renderChunkRow(document.getElementById('cdc-before'),   beforeBytes, cChunksBefore, new Set(), -1, 'divider-cdc');
+  renderChunkRow(document.getElementById('cdc-after'),    afterBytes,  cChunksAfter,  cChangedIdxs, insertedIdx, 'divider-cdc');
+
+  document.getElementById('fixed-stats').innerHTML = statHtml('Fixed-size: chunks re-uploaded', fChanged, fChunksAfter.length, false);
+  document.getElementById('cdc-stats').innerHTML   = statHtml('CDC: chunks re-uploaded', cChanged, cChunksAfter.length, true);
+}
+render();
+</script>
